@@ -1,0 +1,393 @@
+# Edit livebooks using your preferred text editor.
+
+```elixir
+Mix.install([
+  {:file_system, "~> 0.2.10"}
+])
+```
+
+## About
+
+#### *WARNING!*
+
+This is an experimental[^1] hack/proof of concept.
+It relies on livebook internals and could break at any time.
+The current version has limited[^2] editing capabilities.
+
+#### What is this?
+
+It's a livebook that lets you edit other livebooks using an external text editor.
+
+#### Why not just use the in browser editor?
+
+Livebook is great, but the in browser cell editor doesn't currently support VI keybindings[^3].  This lets me use my own customized editor to edit livebook cells.
+
+#### How it works:
+
+Once evaluated the notebook will create and watch for changes
+in the directory ~/livebook_edits.  When it sees new or modified
+markdown (.md) or elixir script(.exs) files in that folder it
+will add their content to the end of the specified notebook section.
+
+#### Usage:
+
+* Open the notebook and evaluate it.
+
+  * This will create a directory 'livebook_editor' in your home directory
+    and start monitoring that directory for file changes.
+
+* Create a new notebook.
+
+  * Leave the default title "Untitled notebook" and the default section named "Section".
+
+* Now in your text editor create a new file **~/livebook_edits/edit.exs[^4]** with the following content:
+
+  ```
+  IO.puts("Hello")
+  ```
+
+* Save the file and you should see a new cell appended to new "Untitled notebook" section "Section".
+
+##### Targetting a specific notebook and section:
+
+By default it will target a section named "Section" of the notebook titled "Untitled notebook".  You can target a different notebook and section by adding a comment on the first line:
+
+```
+# Notebook Name # Section Name
+IO.puts("Hello, again.")
+```
+
+##### Append or replace cell:
+
+By default a new cell will be appended at the end of the section.
+You can replace the last cell in the section by appending '>' on it's own as the last line of the cell.
+
+```
+# Notebook Name # Section Name
+IO.puts("Last cell's content will be replaced by this.")
+>
+```
+
+##### Markdown cells:
+
+To add a markdown cell, just create a file with the extension **.md** in the **~/livebook_edits** directory. e.g. **~/livebook_edits/edit.md**
+
+```
+# Notebook Name # Section Name
+- Markdown content
+- Goes here
+```
+
+[^1]: It works for my use case on a mac with livebook v0.9.2. Other configurations have not been tested. YMMV.
+
+[^2]: Currently limited to either overwriting the last cell in a notebook section or appending a new cell at the end of a notebook section. I plan to add more capabilities in the future, but I find it is already useful, as is.
+
+[^3]: More info here: https://github.com/livebook-dev/livebook/issues/715
+
+[^4]: You can use any file name as long as it is inside the **~/livebook_edits** directory and has an **.exs** or **.md** extension.
+
+## Code
+
+```elixir
+defmodule Ed do
+  def livebook_node() do
+    nodes = Node.list(:hidden)
+    [lbn] = for n <- nodes, String.contains?(Atom.to_string(n), "livebook"), do: n
+    lbn
+  end
+
+  def livebook_rpc(m, f, a \\ []) when is_atom(m) and is_atom(f) and is_list(a) do
+    :rpc.call(livebook_node(), m, f, a)
+  end
+
+  def sessions() do
+    :rpc.call(livebook_node(), Livebook.Sessions, :list_sessions, [])
+  end
+
+  def session_names() do
+    sessions()
+    |> Enum.map(& &1.notebook_name)
+  end
+
+  def session(notebook_name) do
+    matching = for s <- sessions(), s.notebook_name == notebook_name, do: s
+
+    case matching do
+      [] ->
+        raise "session #{notebook_name} not found!"
+
+      [sess] ->
+        sess
+    end
+  end
+
+  def session_notebook(session) do
+    :rpc.call(livebook_node(), Livebook.Session, :get_notebook, [session.pid])
+  end
+
+  def notebook(notebook_name) do
+    session = session(notebook_name)
+    session_notebook(session)
+  end
+
+  def data(notebook_name) do
+    session = session(notebook_name)
+    session_data(session)
+  end
+
+  def session_data(session) do
+    :rpc.call(livebook_node(), Livebook.Session, :get_data, [session.pid])
+  end
+
+  def sections(notebook_name) do
+    notebook = notebook(notebook_name)
+    notebook.sections
+  end
+
+  def last_section(notebook_name) do
+    sections(notebook_name)
+    |> List.last()
+  end
+
+  def section_names(notebook_name) do
+    sections(notebook_name)
+    |> Enum.map(& &1.name)
+  end
+
+  def section(notebook_name, section_name) do
+    [section] = for s <- sections(notebook_name), s.name == section_name, do: s
+    section
+  end
+
+  def cells(notebook_name, section_name) do
+    section = section(notebook_name, section_name)
+    section.cells
+  end
+
+  def last_cell(notebook_name, section_name) do
+    cells(notebook_name, section_name)
+    |> List.last()
+  end
+
+  def cell_count(notebook_name, section_name) do
+    cells(notebook_name, section_name)
+    |> Enum.count()
+  end
+
+  def insert_cell(notebook_name, section_name, index, type \\ :code) do
+    session = session(notebook_name)
+    section = section(notebook_name, section_name)
+
+    livebook_rpc(
+      Livebook.Session,
+      :insert_cell,
+      [
+        session.pid,
+        section.id,
+        index,
+        type
+      ]
+    )
+  end
+
+  def append_cell(notebook_name, section_name, type \\ :code) do
+    index = cell_count(notebook_name, section_name)
+    insert_cell(notebook_name, section_name, index, type)
+  end
+
+  def delta_new() do
+    livebook_rpc(Livebook.Delta, :new)
+  end
+
+  def delta_insert(delta, string) do
+    livebook_rpc(Livebook.Delta, :insert, [delta, string])
+  end
+
+  def delta_delete(delta, n) do
+    livebook_rpc(Livebook.Delta, :delete, [delta, n])
+  end
+
+  def apply_cell_delta(session_pid, cell_id, delta, revision) do
+    livebook_rpc(
+      Livebook.Session,
+      :apply_cell_delta,
+      [session_pid, cell_id, :primary, delta, revision]
+    )
+  end
+
+  def revision(data, cell) do
+    data.cell_infos[cell.id].sources[:primary].revision
+  end
+
+  def replace_last_cell(notebook_name, section_name, content) do
+    session = session(notebook_name)
+    data = data(notebook_name)
+    cell = last_cell(notebook_name, section_name)
+    revision = revision(data, cell) + 1
+
+    delta =
+      delta_new()
+      |> delta_delete(String.length(cell.source))
+      |> delta_insert(content)
+
+    apply_cell_delta(session.pid, cell.id, delta, revision)
+  end
+
+  def queue_cell_evaluation(session_pid, cell_id) do
+    livebook_rpc(
+      Livebook.Session,
+      :queue_cell_evaluation,
+      [session_pid, cell_id]
+    )
+  end
+
+  def evaluate_last_cell(notebook_name, section_name) do
+    session = session(notebook_name)
+    cell = last_cell(notebook_name, section_name)
+    queue_cell_evaluation(session.pid, cell.id)
+  end
+
+  def default_notebook_last_section() do
+    notebook_name = "Untitled notebook"
+
+    try do
+      section = last_section(notebook_name)
+      {:ok, {notebook_name, section.name}}
+    rescue
+      _ ->
+        {:error, "Couldn't get last section of default notebook: #{notebook_name}"}
+    end
+  end
+end
+```
+
+```elixir
+edits_dir = Path.expand("livebook_edits", System.user_home!())
+```
+
+```elixir
+File.mkdir(edits_dir)
+```
+
+```elixir
+defmodule Tracker do
+  def track(path) do
+    {:ok, fs_pid} = FileSystem.start_link(dirs: [path])
+    FileSystem.subscribe(fs_pid)
+    handle_file_system_events()
+  end
+
+  defp handle_file_system_events() do
+    receive do
+      {:file_event, _worker_pid, {path, [:renamed]}} ->
+        base = Path.basename(path)
+        IO.puts("renamed/moved #{base}")
+
+      {:file_event, _worker_pid, {path, [:removed]}} ->
+        base = Path.basename(path)
+        IO.puts("removed #{base}")
+
+      {:file_event, _worker_pid, {path, events}} ->
+        base = Path.basename(path)
+        ext = Path.extname(path)
+        cell_type = extension_cell_type(ext)
+
+        case base do
+          "stop" ->
+            IO.puts("stopped")
+            nil
+
+          base ->
+            IO.puts("#{base}: #{inspect(events)}")
+
+            content =
+              File.read!(path)
+              # avoid adding empty last line to cell
+              |> String.trim_trailing("\n")
+
+            {action, content} = append_or_replace(content)
+
+            case get_notebook_section_from_initial_comment(content) do
+              {:ok, {notebook_name, section_name, remaining_content}} ->
+                apply_cell_content(
+                  notebook_name,
+                  section_name,
+                  remaining_content,
+                  cell_type,
+                  action
+                )
+
+              {:error, _} ->
+                case Ed.default_notebook_last_section() do
+                  {:ok, {notebook_name, section_name}} ->
+                    apply_cell_content(notebook_name, section_name, content, cell_type, action)
+
+                  {:error, error} ->
+                    IO.puts(error)
+                end
+            end
+
+            handle_file_system_events()
+        end
+
+      fs_event ->
+        IO.puts("ignored unexpected file system event: #{inspect(fs_event)}")
+    end
+  end
+
+  def extension_cell_type(".exs"), do: :code
+  def extension_cell_type(".md"), do: :markdown
+  def extension_cell_type(_), do: :markdown
+
+  def apply_cell_content(notebook_name, section_name, content, cell_type, action) do
+    if action == :append, do: Ed.append_cell(notebook_name, section_name, cell_type)
+    Ed.replace_last_cell(notebook_name, section_name, content)
+
+    if cell_type == :code do
+      Ed.evaluate_last_cell(notebook_name, section_name)
+    end
+  end
+
+  def append_or_replace(content) do
+    if String.ends_with?(content, "\n>>") do
+      {:append, String.slice(content, 0..-4)}
+    else
+      if String.ends_with?(content, "\n>") do
+        {:replace, String.slice(content, 0..-3)}
+      else
+        {:append, content}
+      end
+    end
+  end
+
+  def get_notebook_section_from_initial_comment(content) do
+    [first, rest] =
+      case String.split(content, "\n", parts: 2) do
+        [first] ->
+          [first, ""]
+
+        [first, rest] ->
+          [first, rest]
+      end
+
+    notebook_section_comment(first, rest)
+  end
+
+  def notebook_section_comment(first, rest) do
+    case Regex.named_captures(
+           ~r/^\s*#\s*(?<notebook_name>[^#]+?)\s*#\s*(?<section_name>[^#]+?)\s*$/,
+           first
+         ) do
+      %{"notebook_name" => notebook_name, "section_name" => section_name} ->
+        {:ok, {notebook_name, section_name, rest}}
+
+      nil ->
+        {:error, "Initial comment not found"}
+    end
+  end
+end
+```
+
+```elixir
+Tracker.track(edits_dir)
+```
